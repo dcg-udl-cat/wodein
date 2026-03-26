@@ -1,0 +1,9 @@
+# Scripts related
+temp.yaml
+.logs-db/
+fabric-samples
+install-fabric.sh
+
+# Nix related
+result
+.direnv

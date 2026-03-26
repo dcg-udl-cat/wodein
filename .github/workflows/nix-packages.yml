@@ -1,0 +1,72 @@
+name: Nix Package Builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.system }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [x86_64-linux ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Build packages for ${{ matrix.system }}
+        env:
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            extra-platforms = x86_64-linux aarch64-linux
+        run: |
+          set -euo pipefail
+          packages=(auctioneer client oracle auctioneer-image oracle-image)
+          for pkg in "${packages[@]}"; do
+            echo ">>> building ${pkg} for ${{ matrix.system }}"
+            nix build ".#packages.${{ matrix.system }}.${pkg}" --print-build-logs
+          done
+
+  darwin:
+    name: Darwin (${{ matrix.system }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [aarch64-darwin, x86_64-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Ensure Rosetta (x86_64 only)
+        if: matrix.system == 'x86_64-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Build packages for ${{ matrix.system }}
+        env:
+          NIX_CONFIG: |
+            experimental-features = nix-command flakes
+            extra-platforms = x86_64-darwin aarch64-darwin
+        run: |
+          set -euo pipefail
+          packages=(auctioneer client oracle auctioneer-image oracle-image)
+          for pkg in "${packages[@]}"; do
+            echo ">>> building ${pkg} for ${{ matrix.system }}"
+            nix build ".#packages.${{ matrix.system }}.${pkg}" --print-build-logs
+          done

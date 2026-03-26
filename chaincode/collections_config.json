@@ -1,0 +1,20 @@
+[
+  {
+    "name": "collectionOrg2Auctioneer",
+    "policy": "OR('Org2MSP.member', 'Org1MSP.member')",
+    "requiredPeerCount": 1,
+    "maxPeerCount": 2,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  },
+  {
+    "name": "collectionOrg3Auctioneer",
+    "policy": "OR('Org3MSP.member', 'Org1MSP.member')",
+    "requiredPeerCount": 1,
+    "maxPeerCount": 2,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  }
+]
