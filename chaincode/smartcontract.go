@@ -296,32 +296,32 @@ func (s *SmartContract) CloseAuction(ctx contractapi.TransactionContextInterface
 	return nil
 }
 
-func (s *SmartContract) AddVerity(ctx contractapi.TransactionContextInterface, orderID string, hash string) error {
-	orderID = strings.TrimSpace(orderID)
-	hash = strings.ToLower(strings.TrimSpace(hash))
-
-	if orderID == "" {
-		return fmt.Errorf("order_id is required")
-	}
-	if hash == "" {
-		return fmt.Errorf("hash is required")
-	}
-	if len(hash) != 64 {
-		return fmt.Errorf("hash must be a sha256 hex string")
-	}
-
-	if existing, err := ctx.GetStub().GetState(buildVerityKey(orderID)); err != nil {
-		return fmt.Errorf("failed checking existing verity record: %w", err)
-	} else if existing != nil {
-		return fmt.Errorf("verity entry for order_id %s already exists", orderID)
-	}
-
-	if err := s.saveVerityHash(ctx, orderID, hash); err != nil {
-		return fmt.Errorf("failed storing verity: %w", err)
-	}
-
-	return nil
-}
+// func (s *SmartContract) AddVerity(ctx contractapi.TransactionContextInterface, orderID string, hash string) error {
+// 	orderID = strings.TrimSpace(orderID)
+// 	hash = strings.ToLower(strings.TrimSpace(hash))
+//
+// 	if orderID == "" {
+// 		return fmt.Errorf("order_id is required")
+// 	}
+// 	if hash == "" {
+// 		return fmt.Errorf("hash is required")
+// 	}
+// 	if len(hash) != 64 {
+// 		return fmt.Errorf("hash must be a sha256 hex string")
+// 	}
+//
+// 	if existing, err := ctx.GetStub().GetState(buildVerityKey(orderID)); err != nil {
+// 		return fmt.Errorf("failed checking existing verity record: %w", err)
+// 	} else if existing != nil {
+// 		return fmt.Errorf("verity entry for order_id %s already exists", orderID)
+// 	}
+//
+// 	if err := s.saveVerityHash(ctx, orderID, hash); err != nil {
+// 		return fmt.Errorf("failed storing verity: %w", err)
+// 	}
+//
+// 	return nil
+// }
 
 func (s *SmartContract) GetVerity(ctx contractapi.TransactionContextInterface, orderID string) (*OrderHashRecord, error) {
 	orderID = strings.TrimSpace(orderID)
