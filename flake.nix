@@ -80,7 +80,17 @@
               '';
             }
             {
-              name = "stop";
+              name = "start-blockchain";
+              help = "Start the blockchain stack";
+              command = ''
+                set -e
+                ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+                cd "$ROOT"
+                ./scripts/start-blockchain.sh
+              '';
+            }
+            {
+              name = "stop-blockchain";
               help = "Bring down Fabric test network if fabric-samples/ is present";
               command = ''
                 set -e
