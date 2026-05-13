@@ -1,0 +1,16 @@
+{
+  "node_id": "oracle-1",
+  "listen_address": "0.0.0.0:9101",
+  "peers": [
+    {
+      "id": "oracle-2",
+      "address": "oracle-2:9102"
+    },
+    {
+      "id": "oracle-3",
+      "address": "oracle-3:9103"
+    }
+  ],
+  "heartbeat_interval": "1s",
+  "peer_timeout": "3s"
+}

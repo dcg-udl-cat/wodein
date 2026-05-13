@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,7 +40,45 @@ type Config struct {
 	CheckpointFile      string
 	ReconnectDelay      time.Duration
 	MaxParallelPeriods  int
+	OracleCluster       OracleClusterConfig
 	LogLevel            slog.Level
+}
+
+type OracleClusterConfig struct {
+	Enabled           bool
+	NodeID            string
+	ListenAddress     string
+	Peers             []OraclePeerConfig
+	HeartbeatInterval time.Duration
+	PeerTimeout       time.Duration
+}
+
+type OraclePeerConfig struct {
+	ID      string `json:"id"`
+	Address string `json:"address"`
+}
+
+type oracleClusterFileConfig struct {
+	NodeID            string             `json:"node_id"`
+	ListenAddress     string             `json:"listen_address"`
+	Peers             []OraclePeerConfig `json:"peers"`
+	HeartbeatInterval string             `json:"heartbeat_interval"`
+	PeerTimeout       string             `json:"peer_timeout"`
+}
+
+type OracleCluster struct {
+	cfg    OracleClusterConfig
+	logger *slog.Logger
+
+	mu            sync.RWMutex
+	conn          *net.UDPConn
+	peerLastSeen  map[string]time.Time
+	currentLeader string
+}
+
+type oracleHeartbeat struct {
+	NodeID string `json:"node_id"`
+	SentAt int64  `json:"sent_at"`
 }
 
 type CloseAuctionEvent struct {
@@ -115,6 +154,7 @@ type SettlementListener struct {
 	network      *client.Network
 	checkpointer *client.FileCheckpointer
 	processor    *SettlementService
+	cluster      *OracleCluster
 }
 
 type AuctionIDResolver struct{}
@@ -173,16 +213,30 @@ func main() {
 	})
 	settlementService.UseClearingAlgorithm("greedy-order-book")
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	cluster := NewOracleCluster(cfg.OracleCluster, logger)
+	if cluster.Enabled() {
+		if err := cluster.Start(ctx); err != nil {
+			logger.Error("failed to start oracle cluster", "error", err)
+			os.Exit(1)
+		}
+		defer cluster.Close()
+		if err := cluster.WaitForInitialElection(ctx); err != nil {
+			logger.Error("oracle cluster stopped before initial election completed", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	listener := &SettlementListener{
 		cfg:          cfg,
 		logger:       logger,
 		network:      fabricClient.network,
 		checkpointer: checkpointer,
 		processor:    settlementService,
+		cluster:      cluster,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	logger.Info(
 		"settlement listener started",
@@ -236,6 +290,10 @@ func loadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cfg.OracleCluster, err = loadOracleClusterConfig(envOrDefault("APP_ORACLE_CLUSTER_CONFIG", ""))
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg.MaxParallelPeriods = 4
 	if raw := strings.TrimSpace(os.Getenv("APP_MAX_PARALLEL_PERIODS")); raw != "" {
@@ -261,6 +319,77 @@ func loadConfig() (Config, error) {
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
+
+	return cfg, nil
+}
+
+func loadOracleClusterConfig(path string) (OracleClusterConfig, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return OracleClusterConfig{}, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return OracleClusterConfig{}, fmt.Errorf("read APP_ORACLE_CLUSTER_CONFIG: %w", err)
+	}
+
+	var fileCfg oracleClusterFileConfig
+	if err := json.Unmarshal(data, &fileCfg); err != nil {
+		return OracleClusterConfig{}, fmt.Errorf("decode oracle cluster config: %w", err)
+	}
+
+	cfg := OracleClusterConfig{
+		Enabled:           true,
+		NodeID:            strings.TrimSpace(fileCfg.NodeID),
+		ListenAddress:     strings.TrimSpace(fileCfg.ListenAddress),
+		Peers:             make([]OraclePeerConfig, 0, len(fileCfg.Peers)),
+		HeartbeatInterval: time.Second,
+		PeerTimeout:       3 * time.Second,
+	}
+
+	if cfg.NodeID == "" {
+		return OracleClusterConfig{}, fmt.Errorf("oracle cluster config requires node_id")
+	}
+	if cfg.ListenAddress == "" {
+		return OracleClusterConfig{}, fmt.Errorf("oracle cluster config requires listen_address")
+	}
+
+	if strings.TrimSpace(fileCfg.HeartbeatInterval) != "" {
+		cfg.HeartbeatInterval, err = time.ParseDuration(strings.TrimSpace(fileCfg.HeartbeatInterval))
+		if err != nil {
+			return OracleClusterConfig{}, fmt.Errorf("invalid oracle heartbeat_interval: %w", err)
+		}
+	}
+	if strings.TrimSpace(fileCfg.PeerTimeout) != "" {
+		cfg.PeerTimeout, err = time.ParseDuration(strings.TrimSpace(fileCfg.PeerTimeout))
+		if err != nil {
+			return OracleClusterConfig{}, fmt.Errorf("invalid oracle peer_timeout: %w", err)
+		}
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		return OracleClusterConfig{}, fmt.Errorf("oracle heartbeat_interval must be positive")
+	}
+	if cfg.PeerTimeout <= cfg.HeartbeatInterval {
+		return OracleClusterConfig{}, fmt.Errorf("oracle peer_timeout must be greater than heartbeat_interval")
+	}
+
+	seen := map[string]struct{}{cfg.NodeID: {}}
+	for _, peer := range fileCfg.Peers {
+		peer.ID = strings.TrimSpace(peer.ID)
+		peer.Address = strings.TrimSpace(peer.Address)
+		if peer.ID == "" {
+			return OracleClusterConfig{}, fmt.Errorf("oracle peer id is required")
+		}
+		if peer.Address == "" {
+			return OracleClusterConfig{}, fmt.Errorf("oracle peer %s address is required", peer.ID)
+		}
+		if _, ok := seen[peer.ID]; ok {
+			return OracleClusterConfig{}, fmt.Errorf("duplicate oracle node id %s", peer.ID)
+		}
+		seen[peer.ID] = struct{}{}
+		cfg.Peers = append(cfg.Peers, peer)
 	}
 
 	return cfg, nil
@@ -352,6 +481,236 @@ func newGRPCConnection(cfg Config) (*grpc.ClientConn, error) {
 	}
 
 	return conn, nil
+}
+
+func NewOracleCluster(cfg OracleClusterConfig, logger *slog.Logger) *OracleCluster {
+	return &OracleCluster{
+		cfg:          cfg,
+		logger:       logger,
+		peerLastSeen: map[string]time.Time{},
+	}
+}
+
+func (c *OracleCluster) Enabled() bool {
+	return c != nil && c.cfg.Enabled
+}
+
+func (c *OracleCluster) Start(ctx context.Context) error {
+	if !c.Enabled() {
+		return nil
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", c.cfg.ListenAddress)
+	if err != nil {
+		return fmt.Errorf("resolve oracle heartbeat listen address: %w", err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for oracle heartbeats on %s: %w", c.cfg.ListenAddress, err)
+	}
+
+	c.mu.Lock()
+	c.conn = conn
+	c.currentLeader = c.leaderIDLocked(time.Now())
+	c.mu.Unlock()
+
+	c.logger.Info(
+		"oracle cluster started",
+		"node_id", c.cfg.NodeID,
+		"listen_address", c.cfg.ListenAddress,
+		"leader", c.currentLeader,
+		"peers", len(c.cfg.Peers),
+	)
+
+	go c.receiveLoop(ctx, conn)
+	go c.heartbeatLoop(ctx)
+	go c.leaderMonitorLoop(ctx)
+
+	go func() {
+		<-ctx.Done()
+		c.Close()
+	}()
+
+	return nil
+}
+
+func (c *OracleCluster) Close() {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (c *OracleCluster) WaitForInitialElection(ctx context.Context) error {
+	if !c.Enabled() || len(c.cfg.Peers) == 0 {
+		return nil
+	}
+
+	c.logger.Info("waiting for initial oracle leader election", "duration", c.cfg.PeerTimeout)
+	if err := sleepWithContext(ctx, c.cfg.PeerTimeout); err != nil {
+		return err
+	}
+
+	c.logger.Info("initial oracle leader election completed", "leader", c.LeaderID())
+	return nil
+}
+
+func (c *OracleCluster) IsLeader() bool {
+	if !c.Enabled() {
+		return true
+	}
+
+	now := time.Now()
+	c.mu.Lock()
+	leader := c.leaderIDLocked(now)
+	changed := leader != c.currentLeader
+	c.currentLeader = leader
+	c.mu.Unlock()
+
+	if changed {
+		c.logger.Info("oracle cluster leader changed", "leader", leader)
+	}
+
+	return leader == c.cfg.NodeID
+}
+
+func (c *OracleCluster) LeaderID() string {
+	if !c.Enabled() {
+		return ""
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.currentLeader = c.leaderIDLocked(time.Now())
+	return c.currentLeader
+}
+
+func (c *OracleCluster) receiveLoop(ctx context.Context, conn *net.UDPConn) {
+	buf := make([]byte, 4096)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			c.logger.Warn("failed to read oracle heartbeat", "error", err)
+			continue
+		}
+
+		var heartbeat oracleHeartbeat
+		if err := json.Unmarshal(buf[:n], &heartbeat); err != nil {
+			c.logger.Warn("failed to decode oracle heartbeat", "error", err)
+			continue
+		}
+
+		nodeID := strings.TrimSpace(heartbeat.NodeID)
+		if nodeID == "" || nodeID == c.cfg.NodeID {
+			continue
+		}
+		if !c.isConfiguredPeer(nodeID) {
+			c.logger.Warn("ignoring heartbeat from unknown oracle", "node_id", nodeID)
+			continue
+		}
+
+		c.mu.Lock()
+		c.peerLastSeen[nodeID] = time.Now()
+		c.mu.Unlock()
+	}
+}
+
+func (c *OracleCluster) heartbeatLoop(ctx context.Context) {
+	c.sendHeartbeat(ctx)
+
+	ticker := time.NewTicker(c.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.sendHeartbeat(ctx)
+		}
+	}
+}
+
+func (c *OracleCluster) leaderMonitorLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.IsLeader()
+		}
+	}
+}
+
+func (c *OracleCluster) sendHeartbeat(ctx context.Context) {
+	if len(c.cfg.Peers) == 0 {
+		return
+	}
+
+	payload, err := json.Marshal(oracleHeartbeat{
+		NodeID: c.cfg.NodeID,
+		SentAt: time.Now().UnixNano(),
+	})
+	if err != nil {
+		c.logger.Error("failed to encode oracle heartbeat", "error", err)
+		return
+	}
+
+	for _, peer := range c.cfg.Peers {
+		if ctx.Err() != nil {
+			return
+		}
+		addr, err := net.ResolveUDPAddr("udp", peer.Address)
+		if err != nil {
+			c.logger.Warn("failed to resolve oracle peer", "peer_id", peer.ID, "address", peer.Address, "error", err)
+			continue
+		}
+		conn, err := net.DialUDP("udp", nil, addr)
+		if err != nil {
+			c.logger.Warn("failed to open oracle heartbeat connection", "peer_id", peer.ID, "address", peer.Address, "error", err)
+			continue
+		}
+		if _, err := conn.Write(payload); err != nil {
+			c.logger.Warn("failed to send oracle heartbeat", "peer_id", peer.ID, "address", peer.Address, "error", err)
+		}
+		_ = conn.Close()
+	}
+}
+
+func (c *OracleCluster) leaderIDLocked(now time.Time) string {
+	alive := []string{c.cfg.NodeID}
+	for _, peer := range c.cfg.Peers {
+		lastSeen, ok := c.peerLastSeen[peer.ID]
+		if ok && now.Sub(lastSeen) <= c.cfg.PeerTimeout {
+			alive = append(alive, peer.ID)
+		}
+	}
+	sort.Strings(alive)
+	return alive[0]
+}
+
+func (c *OracleCluster) isConfiguredPeer(nodeID string) bool {
+	for _, peer := range c.cfg.Peers {
+		if peer.ID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func newIdentity(cfg Config) (*identity.X509Identity, error) {
@@ -489,6 +848,15 @@ func (l *SettlementListener) handleCloseAuctionEvent(ctx context.Context, event 
 		"block_number", event.BlockNumber,
 		"transaction_id", event.TransactionID,
 	)
+
+	if l.cluster != nil && !l.cluster.IsLeader() {
+		l.logger.Info(
+			"skipping CloseAuction event because this oracle is not the leader",
+			"auction_id", payload.IDAuction,
+			"leader", l.cluster.LeaderID(),
+		)
+		return nil
+	}
 
 	if err := l.processor.ProcessAuctionClosed(ctx, payload.IDAuction); err != nil {
 		return err
