@@ -33,6 +33,7 @@
         ...
       }: let
         auctioneer = pkgs.callPackage ./gateways/auctioneer/package.nix {};
+        blockchain-benchmark = pkgs.callPackage ./benchmarks/blockchain/package.nix {};
         client = pkgs.callPackage ./gateways/client/package.nix {};
         oracle = pkgs.callPackage ./gateways/oracle/package.nix {};
 
@@ -112,7 +113,7 @@
         };
 
         packages = {
-          inherit auctioneer client oracle;
+          inherit auctioneer blockchain-benchmark client oracle;
           auctioneer-image = mkImage {
             name = "auctioneer";
             drv = auctioneer;
