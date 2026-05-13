@@ -46,7 +46,7 @@ Execute it after the blockchain has been started:
 Build the benchmark package:
 
 ```sh
-nix build .#benchmark --out-link benchmark
+nix build .#blockchain-benchmark --out-link benchmark
 ```
 
 Execute it after the blockchain and oracle has been started:
